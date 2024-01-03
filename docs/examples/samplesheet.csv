@@ -1,0 +1,10 @@
+[Settings]
+CreateFastqForIndexReads,1
+MinimumTrimmedReadLength,16
+MaskShortReads,16
+OverrideCycles,Y34;I10;U10;Y76
+TrimUmi,0
+[Data]
+Sample_ID,index
+Plate1,ATCTCGTATG
+Plate2,TAGTCGACCG

@@ -1,0 +1,7 @@
+sample,barcodes,libName,libIndex,guide,allCells
+Sample1Plate1,1A-2H,Plate1,ATCTCGTATG,guides.Sample1.txt,Sample1Plate1.allCells.csv
+Sample2Plate1,3A-7H,Plate1,ATCTCGTATG,guides.Sample2.txt,Sample2Plate1.allCells.csv
+Sample3Plate1,8A-12H,Plate1,ATCTCGTATG,guides.Sample3.txt,Sample3Plate1.allCells.csv
+Sample1Plate2,1A-2H,Plate2,TAGTCGACCG,guides.Sample1.txt,Sample1Plate2.allCells.csv
+Sample2Plate2,3A-7H,Plate2,TAGTCGACCG,guides.Sample2.txt,Sample2Plate2.allCells.csv
+Sample3Plate2,8A-12H,Plate2,TAGTCGACCG,guides.Sample3.txt,Sample3Plate2.allCells.csv

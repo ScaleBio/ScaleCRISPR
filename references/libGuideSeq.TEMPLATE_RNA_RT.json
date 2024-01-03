@@ -1,0 +1,14 @@
+{
+"barcodes" : [
+    {"read": "read1", "start": 0, "length": 9, "name": "lig", "sequences": "3lvlRNA_lig.txt", "level":2, "alias":"Ligation"},
+    {"read": "read1", "start": 9, "length": 10, "name": "rt", "sequences": "3lvlRNA_rt.txt", "level":1, "alias":"RT"},
+    {"read": "read1", "start": 19, "length": 10, "name": "pcr", "sequences": "3lvlRNA_pcr.txt", "level":3, "alias":"I5"},
+    {"read": "read1", "start": 29, "length": 8, "name": "umi", "type": "umi"},
+    {"read": "read2", "start": "START_REPLACE", "length": "LENGTH_REPLACE", "name": "guide", "sequences": "PATH_REPLACE"}
+],
+"sample_barcode": "rt",
+"genomic_r2": {"start":0, "length": 48},
+"bcl_convert": {
+    "library_barcodes": {}
+}
+}

@@ -1,0 +1,23 @@
+##### Required Analysis Parameters
+# Run "nextflow run path/to/crispr_tools --help" for a full list and documentation
+# Also see "nextflow.config" for defaults
+
+##### Inputs
+### Sequencing data input can be either a Illumina sequencer RunFolder (bcl)
+runFolder : /PATH/TO/SEQUENCING/RUN/FOLDER
+### or a directory with fastq files
+# fastqDir : /PATH/TO/FASTQ/FOLDER
+
+### A file listing all samples in the analysis with their barcode sequences and sample settings
+samples : /docs/examples/samples.csv
+
+### Directory containing guide sequence reference files
+guidesDir : /PATH/TO/GUIDES
+
+### Directory containing ScaleRna allCells.csv output files, one per sample
+
+allCellsDir : /PATH/TO/ALLCELLS
+
+### Directory for outputs of workflwo
+
+outDir : /PATH/TO/DESIRED/OUTPUTS/LOCATION

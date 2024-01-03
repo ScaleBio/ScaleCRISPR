@@ -1,0 +1,5 @@
+reports:
+    "*metrics.csv":
+        display: "Sample Summary"
+    "reports/multiqc_report.html":
+        display: "FASTQ MultiQC"
