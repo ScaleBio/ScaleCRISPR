@@ -68,7 +68,7 @@ input:
 	path(libStructDir)
 	tuple(val(sample),path(fastq),path(barcode),path("tmpReferences/updated_LibGuideSeq.json"),path("tmpReferences/guides.output.txt"))
 output:
-	tuple(val(sample),path("${sample}/${sample}_*.barcodes.csv"), emit: barcodesCsv)
+	tuple(val(sample),path("${sample}/${sample}_*.barcodes.csv"),path("tmpReferences/guides.output.txt"), emit: barcodesCsv)
 	tuple(val(sample),path("${sample}/metrics.json"), emit: bc_metrics)
 tag "$sample"
 script:
@@ -83,25 +83,24 @@ process count_guides {
 input:
 	path(allCellsDir)
 	path(libStructDir)
-	tuple(val(sample), path(barcodesCsv),val(allcells)) // bcparser output barcodes.csv and corresponding sample allCells
+	tuple(val(sample),path(barcodesCsv),path(guides),val(allcells)) // bcparser output barcodes.csv, guides file, and corresponding sample allCells
 output:
-	tuple(val(sample), path("guideTab.filtered.csv"), path("cellMetrics.filtered.csv"),val(allcells), emit: count_filtered)
-	tuple(val(sample), path("guideTab.csv"), path("cellMetrics.csv"),val(allcells), emit: count_raw)
-	tuple(val(sample), path("guideReads.csv"), path("guideReads.filtered.csv"),val(allcells), emit: reads)
+	tuple(val(sample), path("filtered.umi.matrix.mtx"), path("cellMetrics.filtered.csv"),val(allcells), emit: count_filtered)
+	tuple(val(sample), path("barcodes.tsv"), path("filtered.barcodes.tsv"), path("features.tsv"), emit: features_barcodes)
+	tuple(val(sample), path("umi.matrix.mtx"), path("cellMetrics.csv"),val(allcells), emit: count_raw)
+	tuple(val(sample), path("reads.matrix.mtx"), path("filtered.reads.matrix.mtx"),val(allcells), emit: reads)
 	tuple(val(sample),path("metrics.csv"), emit: count_metrics)
-publishDir ("${params.outDir}/samples/${sample}/", pattern: "*.csv", mode: 'copy', saveAs: {fn -> 
+publishDir ("${params.outDir}/samples/${sample}/", pattern: "*", mode: 'copy', saveAs: {fn -> 
 	if (fn.endsWith("metrics.csv")) { "${sample}.sample.metrics.csv" }
-	else { "csv/${fn}" }
+	else { "matrix_files/${fn}" }
 	}
 )
 
-//publishDir "${params.outDir}/samples/${sample}/", pattern: "metrics.csv", saveAs:{"${sample}.sample.metrics.csv"}, mode: 'copy'
-//publishDir "${params.outDir}/samples/${sample}/csv/", pattern: "*.csv", mode: 'copy'
 label 'crispr'
 tag "$sample"
 script:
 """
-	countGuides.py ${barcodesCsv} --allcellsCsv ${allCellsDir}/${allcells} --thresh ${params.thresh} --references ${libStructDir} --outDir ./
+	countGuides.py ${barcodesCsv} --allcellsCsv ${allCellsDir}/${allcells} --thresh ${params.thresh} --references ${libStructDir} --guides_file ${guides} --outDir ./
 """
 }
 
@@ -118,7 +117,7 @@ label 'crispr'
 tag "$sample"
 script:
 """
-	cropAnalysis.py --sample ${sample} --guideTabCsv ${guideTab} --allcellsCsv ${allCellsDir}/${allcells} --guideMetricsCsv ${cellMetrics} --thresh ${params.thresh} --outDir ./
+	cropAnalysis.py --sample ${sample} --umi_matrix ${guideTab} --allcellsCsv ${allCellsDir}/${allcells} --guideMetricsCsv ${cellMetrics} --thresh ${params.thresh} --outDir ./
 """
 }
 

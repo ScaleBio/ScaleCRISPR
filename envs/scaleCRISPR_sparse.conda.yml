@@ -1,0 +1,12 @@
+name: scaleCRISPR_sparse
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - biopython
+  - matplotlib
+  - seaborn
