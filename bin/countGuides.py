@@ -2,41 +2,18 @@
 
 
 import argparse
+import pysam
+import json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Tuple
 from collections import defaultdict
-import sys
 import csv
-import collections
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix, lil_matrix
+from scipy.io import mmwrite
 
-# Positive matches in bcParser output
-MatchStatus = ("exact", "corrected")
-
-@dataclass
-class Metrics:
-    """Overall read statistics for the dataset"""
-    reads: int = 0 # Input reads
-    barcodeError: int = 0 # Reads without a valid cell barcode
-    noGuide: int = 0 # Reads without a CRISPR Guide sequence match
-    correct: int = 0 # Usable reads
-    meanReadsPerCell: int = 0 # number of reads per cell. Should be multiplied by correct for ~usable amount
-    nUMIPerCell: int = 0 # number of CROP UMI molecules per cell
-    meanUMIPerGuide: int = 0 # mean number of UMI associated with each guide across the cells
-    passingPercent: int = 0 # percent of cells that had at least thresh Guide UMI's detected
-
-    def print(self, outFn: Path):
-        with open(outFn, 'w') as out:
-            print("Reads", f"{self.reads:}", sep=',', file=out)
-            #print("BarcodeError", f"{self.barcodeError/self.reads:.1%}", sep=',', file=out)
-            print("NoGuide", f"{self.noGuide/self.reads:.1%}", sep=',', file=out)
-            print("Correct", f"{self.correct/self.reads:.1%}", sep=',', file=out)
-            print("ReadsPerCell", f"{self.meanReadsPerCell:}", sep=',', file=out)
-            print("nUMIPerCell", f"{self.nUMIPerCell:}", sep=',', file=out)
-            print("meanUMIPerGuide",f"{self.meanUMIPerGuide:}", sep=',', file=out)
-            print("passingPercent", f"{self.passingPercent:.1%}", sep=',', file=out)
 
 class cellReadCounts:
     """Track reads counts for cell (e.g cell X read combination)"""
@@ -86,193 +63,192 @@ class GuideReadCounts:
         self.guides[guide].addRead(umi)
 
 
-def countGuideReads(barcodesCsv: Path):
-    """Count reads for each cell X guide X UMI combo"""
+def countGuideReads(bam_dir: Path=Path(".")):
+    """Count reads for each cell X guide X UMI combo from bcParser bam output"""
     # BC -> (GUIDE,UMI) -> ReadCount
-    # BC is a tuple of three strings for the three cell-barcode levels (RT, Ligation, PCR)
-    cellGuideReads: Dict[Tuple[str, str, str], GuideReadCounts] = collections.defaultdict(GuideReadCounts)
+    # BC is a tuple of three strings for the three cell-barcode levels, e.g. (RT, Ligation, PCR) for 3lvl
+    cellGuideReads: Dict[Tuple[str, ...], GuideReadCounts] = defaultdict(GuideReadCounts)
     cellReads = cellReadCounts()
-    metrics = Metrics()
-    for row in csv.DictReader(open(barcodesCsv),delimiter="\t"):
-        metrics.reads += 1
-        if not (row['lig_info'].split(',')[0] in MatchStatus and
-        row['rt_info'].split(',')[0] in MatchStatus and
-        row['pcr_info'].split(',')[0] in MatchStatus):
-                metrics.barcodeError += 1
-                continue
-        cell = (row['lig'],row['rt'], row['pcr'])
-        cellReads.addCount(cell) #Count a read for the cell, having had a correct match to the barcode info
-        if not row['guide_info'].split(',')[0] in MatchStatus:
-            metrics.noGuide += 1
-            cellGuideReads[cell].addRead('noGuide',row['Read']) #Count reads that do not have a guide sequence but did have a correct cellular barcode
-            continue
-        metrics.correct += 1
-        cellGuideReads[cell].addRead(row['guide'],row['umi'])
-    return cellGuideReads, metrics, cellReads
+    bam_files = list(bam_dir.glob("*.bam")) + list(bam_dir.glob("*.cram"))
+    for bam in bam_files:
+        with pysam.AlignmentFile(bam, "rb", check_sq=False) as samfile:
+            for read in samfile.fetch(until_eof=True):
+                umi = read.get_tag("UM")
+                cell = tuple(read.get_tag("CB").split("+"))
+                cellReads.addCount(cell)  # Count a read for the cell, having had a correct match to the barcode info
+                if read.has_tag("tg"):
+                    cellGuideReads[cell].addRead(read.get_tag("tg"), umi)
+                else:
+                    # Count reads that do not have a guide sequence but did have a correct cellular barcode
+                    cellGuideReads[cell].addRead("noGuide", read.query_name)
 
-def guideAssignment(guideTab,guideThresh):
-    mxs = guideTab.ge(guideThresh, axis=0) #any column that has a value >= to the threshold, for each cell
-    # join the column names of the passing values of each row into a single string separated by a ";" character
-    return mxs.dot(mxs.columns + ';').str.rstrip(';')
+    return cellGuideReads, cellReads
 
+def create_sparse_matrix(counts_data_dict, column_file):
+    """
+    Generate the sparse matrix for counts and UMI's from the dictionary output by countGuideReads BC -> (GUIDE,UMI) -> ReadCount
+    Args:
+        counts_data_dict: dictionary output by countGuideReads in the format of BC -> (GUIDE,UMI) -> ReadCount
+        column_file: the guide whitelist used by bcParser for guide detection, first column is barcode sequences and second column are the aliases
+    Returns:
+        umi_sparse_matrix: csr sparse matrix of umi counts, in cells x guides orientation
+        reads_sparse_matrix: csr sparse matrix of read counts, in cells x guides orientation
+        cell_mapping: dictionary of mapping of cell barocdes to their index with tuple of cell barcode alias's as keys, and corresponding index in matrix as values (rows here)
+        guide_mapping: dictionary of mapping of guide alias to their index in the matrix (columns here)
+        no_guide_df: single column pd.Dataframe containing the number of reads with no guide per cell. Eventually appends to cellMetrics and converted to a percentage
+    """
 
-def cellBarcodeConcat(referencePath,inputDF):
-    ligation_df = pd.read_csv(f'{referencePath}/3lvlRNA_lig.txt', sep="\t", names=['Barcode','Alias'])
-    ligation_dict = dict(zip(ligation_df.Alias,ligation_df.Barcode))
-    rt_df = pd.read_csv(f'{referencePath}/3lvlRNA_rt.txt', sep="\t", names=['Barcode','Alias'])
-    rt_dict = dict(zip(rt_df.Alias,rt_df.Barcode))
-    pcr_df = pd.read_csv(f'{referencePath}/3lvlRNA_pcr.txt', sep="\t", names=['Barcode','Alias'])
-    pcr_dict = dict(zip(pcr_df.Alias,pcr_df.Barcode))
-    alias_df = pd.DataFrame(inputDF.index.tolist(), columns = ['Ligation_alias', 'RT_alias', 'i5_alias'])
-    alias_df['Ligation_alias'] = alias_df['Ligation_alias'].replace(ligation_dict)
-    alias_df['RT_alias'] = alias_df['RT_alias'].replace(rt_dict)
-    alias_df['i5_alias'] = alias_df['i5_alias'].replace(pcr_dict)
-    alias_df['Cell_Barcode'] = alias_df['Ligation_alias'].astype(str) + alias_df['RT_alias'].astype(str) + alias_df['i5_alias'].astype(str)
-    inputDF.insert(0,"Cell_Barcode",alias_df['Cell_Barcode'].values)
+    # Read in guide whitelist used for detection in bcParser to parse into a list that will become our columns in the matrix being built
+    with open(column_file, 'r') as f:
+        reader = csv.reader(f, delimiter='\t')
+        guides = [row[0] for row in reader]
 
+    # Create mappings for row and column indices
+    cell_mapping = {row: idx for idx, row in enumerate(counts_data_dict.keys())}
+    guide_mapping = {col: idx for idx, col in enumerate(guides)}
 
-def main(barcodesCsv: Path, allcellsCsv: Path, recountGuideTab: Path, recountCellMetrics: Path, recountGuideReads: Path, thresh: int, references: Path, outDir: Path):
-    if (recountGuideTab is not None) and (recountCellMetrics is not None):
-        cellGuideTab = pd.read_csv(recountGuideTab, index_col=[0,1,2])
-        cellMetrics = pd.read_csv(recountCellMetrics, index_col=[0,1,2])
-        cellGuideReads = pd.read_csv(recountGuideReads, index_col=[0,1,2])
-        metrics = Metrics()
-        metrics.reads = 1
-    else:
-        cellGuideReads, metrics, cellReads = countGuideReads(barcodesCsv)
-        # Create  a table with UMI counts for each cell X guide combo
-        # cellGuideCounts: Dict[]= {}
-        cellMetrics = pd.DataFrame.from_dict(cellReads.counts, orient='index', columns=['CROP_nReads'])
-        cellMetrics.index = pd.MultiIndex.from_tuples(cellMetrics.index, names=['Ligation_alias', 'RT_alias', 'i5_alias'])
-        
-        cellGuideReadCounts = defaultdict()
-        cellGuideCounts = defaultdict()
-        for cell in cellGuideReads:
-            cellGuideCounts[cell] = {}
-            cellGuideReadCounts[cell] = {}
-            for guide in cellGuideReads[cell].guides:
-                cellGuideCounts[cell][guide] = cellGuideReads[cell].guides[guide].nUmis(1)
-                cellGuideReadCounts[cell][guide] = sum(cellGuideReads[cell].guides[guide].counts.values())
-        
-        cellGuideReads = pd.DataFrame.from_dict(cellGuideReadCounts).transpose().fillna(0)
-        cellGuideReads.index.names = ['Ligation_alias', 'RT_alias', 'i5_alias']
+    # Initialize lists to store row indices, column indices, and data for the sparse matrix
+    rows = []
+    cols = []
+    umi_data = []
+    reads_data = []
+    no_guide_values = {row_key: 0 for row_key in counts_data_dict.keys()} 
 
-        cellGuideTab = pd.DataFrame.from_dict(cellGuideCounts).transpose().fillna(0)
-        cellGuideTab.index.names = ['Ligation_alias', 'RT_alias', 'i5_alias']
+    # Populate the lists with data from the dictionary generated by countGuideReads, BC -> (GUIDE,UMI) -> ReadCount
+    for row_key in counts_data_dict.keys():
+        row_idx = cell_mapping[row_key]
+        for guide in counts_data_dict[row_key].guides:
+            if guide in guide_mapping:
+                col_idx = guide_mapping[guide]
+                rows.append(row_idx)
+                cols.append(col_idx)
+                umi_data_val = counts_data_dict[row_key].guides[guide].nUmis(1)
+                umi_data.append(umi_data_val)
 
-        #Continue updating cellMetrics df
+                reads_data_val = sum(counts_data_dict[row_key].guides[guide].counts.values())
+                reads_data.append(reads_data_val)
+            elif guide == "noGuide":
+                no_guide_values[row_key] = counts_data_dict[row_key].guides[guide].nUmis(1)
 
-        cellMetrics['CROP_noGuide'] = cellGuideTab['noGuide']/cellMetrics['CROP_nReads'] #Percentage of reads with no guide detected
-        cellGuideTab = cellGuideTab.drop(['noGuide'], axis=1) # remove the noGuide column for downstream calcualtions and ultimate writing out of guide matrix
-        cellMetrics = cellMetrics.filter(items = cellGuideTab.index, axis = 0) # reconcile any cells that might have discrepancy between the two after this filtering.
-        cellMetrics['CROP_nUMI'] = (cellGuideTab.sum(1)) # number of unique guide UMI detected 
-        cellMetrics['CROP_nGuide'] = (cellGuideTab>0).sum(1) # number of unique guide's detected, like unique genes detected
-        cellMetrics['CROP_max'] = cellGuideTab.max(1) # max number of UMI detected across the guides within a cell
-        cellMetrics['CROP_second'] = cellGuideTab.apply(lambda row: row.nlargest(2).values[-1],axis=1) # second highest number of UMI of any guide within a cell
-        cellMetrics['CROP_purity'] = (cellMetrics['CROP_max'] / cellMetrics['CROP_nUMI']) 
-        cellMetrics['CROP_topTwo'] = ((cellMetrics['CROP_max']+cellMetrics['CROP_second']) / cellMetrics['CROP_nUMI'])
-        cellMetrics['CROP_minorFrac'] = cellMetrics['CROP_second'] / cellMetrics['CROP_max']
-        cellMetrics['CROP_guides'] = (cellGuideTab>=thresh).sum(1) # how many guides per cell passed a minimum detection threshold
-        cellMetrics['CROP_Saturation'] = 1 - (cellMetrics.CROP_nUMI / (cellMetrics.CROP_nReads - (cellMetrics.CROP_nReads * cellMetrics.CROP_noGuide))) #Saturation 
-        cellMetrics['CROP_assignedGuide'] = guideAssignment(cellGuideTab, thresh) #guide assignemt of any guides that are = max UMI value for that cell
+    # Create the sparse matrix, cells x guides
+    umi_sparse_matrix = csr_matrix((umi_data, (rows, cols)), shape=(len(cell_mapping), len(guide_mapping)))
+
+    reads_sparse_matrix = csr_matrix((reads_data, (rows, cols)), shape=(len(cell_mapping), len(guide_mapping)))
     
 
-    #optional filtering of cell metrics, guide UMI matrices and subsequent sample metrics quantitation
-    if allcellsCsv is not None:
-        #filter cellMetrics to only those in the RNA data that match the passing criteria in the RNA data
-        rna = pd.read_csv(allcellsCsv)
-        if 'i7_alias' in rna:
-           rna = rna.rename(columns={"i7_alias": "i5_alias"}) #easy merging for downstream filtering in case a legacy i7 plate was used
-        if 'I7_alias' in rna:
-           rna = rna.rename(columns={"I7_alias": "i5_alias"}) 
-        rna.index = pd.MultiIndex.from_frame(rna[['Ligation_alias', 'RT_alias', 'i5_alias']])
-        rna_filtered = rna[rna['pass']]
-        # I am only filtering on passing criteria here, without also filtering on i5_alias. The assumption is that for most workflows these should align
-        cellMetrics_Filtered = rna_filtered.merge(cellMetrics, how='left', left_index=True, right_index=True)
-        cellBarcodeConcat(references,cellMetrics_Filtered)
-        cellMetrics_Filtered.fillna(0, inplace=True)
-        cellMetrics_Filtered.drop(rna_filtered.columns, axis=1, inplace=True)
-        cellMetrics_Filtered.loc[cellMetrics_Filtered['CROP_max'] < thresh, 'CROP_assignedGuide'] = 'NONE' #Set all non-assigned guide cells to 'NONE'
-        
-        cellMetrics_Filtered = cellMetrics_Filtered.reset_index()       
-        cellMetrics_Filtered = cellMetrics_Filtered.set_index('Cell_Barcode')
-        cellMetrics_Filtered.to_csv(outDir / "cellMetrics.filtered.csv")
-        metrics.meanReadsPerCell = round(cellMetrics_Filtered['CROP_nReads'].mean(0),1)
-        metrics.nUMIPerCell = round(cellMetrics_Filtered['CROP_nUMI'].median(0),1)
-        metrics.nUMIPerCell = round(cellMetrics_Filtered['CROP_nUMI'].median(0),1)
-        metrics.passingPercent = (cellMetrics_Filtered['CROP_max']>=thresh).mean()
-        cellGuideTab_Filtered = rna_filtered.merge(cellGuideTab, how='left', left_index=True, right_index=True)
-        cellBarcodeConcat(references,cellGuideTab_Filtered)
-        cellGuideTab_Filtered.fillna(0, inplace=True)
-        cellGuideTab_Filtered.drop(rna_filtered.columns, axis=1, inplace=True)
-        cellGuideTab_noBC = cellGuideTab_Filtered.drop(['Cell_Barcode'], axis=1)
-        metrics.meanUMIPerGuide = round((cellGuideTab_noBC.sum(0)).mean(),1)
+    # Create a separate series for "noMatch" values mapped according to row_mapping
+    no_guide_series = pd.Series({row_key: no_guide_values[row_key] for row_key in counts_data_dict.keys()})
 
-        cellGuideTab_Filtered = cellGuideTab_Filtered.reset_index(drop=True)
-        cellGuideTab_Filtered = cellGuideTab_Filtered.set_index('Cell_Barcode')
-        #cellGuideTab_Filtered.drop(['Ligation_alias', 'RT_alias', 'i5_alias'], axis=1, inplace=True)
-        cellGuideTab_Filtered.to_csv(outDir / "guideTab.filtered.csv")
+    no_guide_df = no_guide_series.to_frame(name='noGuide')
 
-        cellGuideReads_Filtered = rna_filtered.merge(cellGuideReads, how='left', left_index=True, right_index=True)
-        cellBarcodeConcat(references,cellGuideReads_Filtered)
-        cellGuideReads_Filtered.fillna(0, inplace=True)
-        cellGuideReads_Filtered.drop(rna_filtered.columns, axis=1, inplace=True)
-        cellGuideReads_Filtered = cellGuideReads_Filtered.reset_index(drop=True)
-        cellGuideReads_Filtered = cellGuideReads_Filtered.set_index('Cell_Barcode')
-        #cellGuideReads_Filtered.drop(['Ligation_alias', 'RT_alias', 'i5_alias'], axis=1, inplace=True)
+    return umi_sparse_matrix, reads_sparse_matrix, cell_mapping, guide_mapping, no_guide_df
 
-        cellGuideReads_Filtered.to_csv(outDir / "guideReads.filtered.csv")
-    else:
-        cellMetrics.loc[cellMetrics['CROP_max'] < thresh, 'CROP_assignedGuide'] = 'NONE' #reassigns any guides who's max is below the threshold to 'NONE'
-        metrics.meanReadsPerCell = round(cellMetrics['CROP_nReads'].mean(0),1)
-        metrics.nUMIPerCell = round(cellMetrics['CROP_nUMI'].median(0),1)
-        metrics.meanUMIPerGuide = round((cellGuideTab.sum(0)).mean(),1)
-        metrics.passingPercent = (cellMetrics['CROP_max']>=thresh).mean()
 
-    cellBarcodeConcat(references,cellGuideTab)
-    cellBarcodeConcat(references,cellMetrics)
-    cellBarcodeConcat(references,cellGuideReads)
+def find_second_highest_value_per_row(sparse_matrix):
+    """Return value for the second highest detected guide per cell"""
+    # Initialize an array to store second highest values
+    second_highest_values = np.zeros(sparse_matrix.shape[0])
 
-    #handle cells with unassinged guides in the non-filtered matrix
-    cellMetrics.fillna(0, inplace=True)
-    cellMetrics.loc[cellMetrics['CROP_max'] < thresh, 'CROP_assignedGuide'] = 'NONE'
+    # Iterate over rows
+    for i in range(sparse_matrix.shape[0]):
+        # Get row data
+        row_data = sparse_matrix.getrow(i).data
+
+        # Find the second highest value
+        if len(row_data) > 1:
+            row_data_sorted = np.sort(row_data)
+            second_highest_values[i] = int(row_data_sorted[-2])
+
+    return second_highest_values
+
+def guide_assignment(sparse_matrix, threshold, column_mapping):
+    """Creates a list of guides (columns) that passed the minimum UMI threshold within each cell"""
+    # Initialize an empty list to store column names
+    column_names_list = []
+
+    # Iterate over rows
+    for i in range(sparse_matrix.shape[0]):
+        # Find column indices with values above threshold for the current row
+        indices_above_threshold = (sparse_matrix[i, :] >= threshold).nonzero()[1]
+
+        # Map column indices to column keys using column mapping dictionary
+        column_keys = [list(column_mapping.keys())[idx] for idx in indices_above_threshold]
+
+        # Join column keys with ";" or append "Fail" if no columns pass
+        if column_keys:
+            column_names_list.append(";".join(column_keys))
+        else:
+            column_names_list.append("Fail")
+
+    return column_names_list
+
+
+def read_lib_json(lib_json: Path):
+    with open(lib_json, 'r') as f:
+        lib_struct = json.load(f)
+    barcodes = []
+    for bc in lib_struct['barcodes']:
+        if bc.get("name") not in ["umi", "guide"]:
+            barcodes.append(bc.get("alias"))
+    return barcodes
+
+
+def main(bam_dir: Path, lib_struct: Path, thresh: int, references: Path, guides_file: Path, outDir: Path, id: str):
+
+    barcodes = read_lib_json(lib_struct) 
+    # 1. Convert barcodesCsv to bam (which will be input, including multiple, in new version)
+    # 2. Load library json to get mapping file, cell barcodes, and guide whitelists
+    cellGuideReads, cellReads = countGuideReads(bam_dir)
+    # Create  a table with UMI counts for each cell X guide combo
+    cellMetrics = pd.DataFrame.from_dict(cellReads.counts, orient='index', columns=['CROP_nReads'])
+    cellMetrics.index = pd.MultiIndex.from_tuples(cellMetrics.index, names=barcodes)
+
+    umi_sparse_counts_matrix, reads_sparse_counts_matrix, _rows_mapped, cols_mapped, noGuides = create_sparse_matrix(cellGuideReads,guides_file)
+
+    cellMetrics["Cell_Barcode"] = cellMetrics.index.map("+".join)
+
+    #Continue updating cellMetrics df
+
+    cellMetrics['CROP_noGuide'] = noGuides['noGuide']/cellMetrics['CROP_nReads'] #Percentage of reads with no guide detected
+    cellMetrics['CROP_nUMI'] = umi_sparse_counts_matrix.sum(axis=1) # number of unique guide UMI detected 
+    cellMetrics['CROP_nGuide'] = umi_sparse_counts_matrix.getnnz(axis=1) # number of unique guide's detected, like unique genes detected
+    cellMetrics['CROP_max'] = umi_sparse_counts_matrix.max(axis=1).toarray().flatten() # max number of UMI detected across the guides within a cell
+    cellMetrics['CROP_second'] = find_second_highest_value_per_row(umi_sparse_counts_matrix) # second highest number of UMI of any guide within a cell
+    cellMetrics['CROP_purity'] = (cellMetrics['CROP_max'] / cellMetrics['CROP_nUMI']) 
+    cellMetrics['CROP_topTwo'] = ((cellMetrics['CROP_max']+cellMetrics['CROP_second']) / cellMetrics['CROP_nUMI'])
+    cellMetrics['CROP_minorFrac'] = cellMetrics['CROP_second'] / cellMetrics['CROP_max']
+    cellMetrics['CROP_guides'] = (umi_sparse_counts_matrix>=thresh).sum(1).A.flatten() # how many guides per cell passed a minimum detection threshold
+    cellMetrics['CROP_Saturation'] = 1 - (cellMetrics.CROP_nUMI / (cellMetrics.CROP_nReads - (cellMetrics.CROP_nReads * cellMetrics.CROP_noGuide))) #Saturation 
+    cellMetrics['CROP_assignedGuide'] = guide_assignment(umi_sparse_counts_matrix, thresh, cols_mapped) #guide assignemt of any guides that are = max UMI value for that cell
+    
     cellMetrics = cellMetrics.reset_index()
+
+    #transpose to be guides x cells to be consistent with rna expression data
+    umi_sparse_counts_matrix = umi_sparse_counts_matrix.transpose()
+    mmwrite(f"{outDir}/{id}.umi.matrix.mtx", umi_sparse_counts_matrix)
+
+    reads_sparse_counts_matrix = reads_sparse_counts_matrix.transpose()
+    mmwrite(f"{outDir}/{id}.reads.matrix.mtx", reads_sparse_counts_matrix)
+    
     cellMetrics = cellMetrics.set_index('Cell_Barcode')
-    cellMetrics.to_csv(outDir / "cellMetrics.csv")
-
-    cellGuideTab = cellGuideTab.reset_index(drop=True)
-    cellGuideTab = cellGuideTab.set_index('Cell_Barcode')
-    #cellGuideTab.drop(['Ligation_alias', 'RT_alias', 'i5_alias'], axis=1, inplace=True)
-    cellGuideTab.to_csv(outDir / "guideTab.csv")
-
-    cellGuideReads = cellGuideReads.reset_index(drop=True)
-    cellGuideReads = cellGuideReads.set_index('Cell_Barcode')
-    #cellGuideReads.drop(['Ligation_alias', 'RT_alias', 'i5_alias'], axis=1, inplace=True)
-    cellGuideReads.to_csv(outDir / "guideReads.csv")
-    
-    metrics.print(outDir / "metrics.csv")
-    
+    cellMetrics.to_csv(outDir / f"{id}.cellMetrics.csv")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Count guide sequences matches from bcParser output')
-    parser.add_argument('barcodesCsv', metavar='BARCODES.csv', type=Path,
-                        help='bcParser per-sample barcode match output')
-    parser.add_argument('--allcellsCsv', metavar='ALLCELLS.csv', type=Path,
-                        help='optional nf-rna per-cell summary statistics output to filter based on pass status')
-    parser.add_argument('--recountGuideTab', metavar='RECOUNTGUIDETAB.csv', type=Path,
-                        help='optional unfiltered guidetab.csv to recount data with new RNA matrix')
-    parser.add_argument('--recountCellMetrics', metavar='RECOUNTCELLMETRICS.csv', type=Path,
-                        help='optional unfiltered guidetab.csv to recount data with new RNA matrix')
-    parser.add_argument('--recountGuideReads', metavar='RECOUNTGUIDEREADS.csv', type=Path,
-                        help='optional unfiltered guideReads.csv to recount data with new RNA matrix')
+    parser.add_argument('bamDir', default='.', metavar='/path/ubam_1.bam', type=Path,
+                        help='Path to seqTagFinder output bam(s) with guide alias in tag')
+    parser.add_argument("--libStruct", type=Path, help="library structure json used for bcParser")
     parser.add_argument('--thresh', metavar='THRESH', nargs='?', const=3, type=int, default=3,
                         help='Theshold for the number of UMIs per guide in order to call a guide detected')
     parser.add_argument('--references', metavar='REFERENCES', type=Path,
                         help='Path to folder containing barcode whitelists')
+    parser.add_argument('--guides_file', metavar='GUIDES_FILE', type=Path,
+                        help='Path to file containing guides list used for detection')
     parser.add_argument('--outDir', type=Path,
                         help='Directory for outputs')
+    parser.add_argument('--id', type=str, help='Sample id for output files')
     args = parser.parse_args()
     args.outDir.mkdir(parents=True, exist_ok=True)
-    main(args.barcodesCsv, args.allcellsCsv, args.recountGuideTab, args.recountCellMetrics, args.recountGuideReads, args.thresh, args.references, args.outDir)
+    main(args.bamDir, args.libStruct, args.thresh, args.references, args.guides_file, args.outDir, args.id)

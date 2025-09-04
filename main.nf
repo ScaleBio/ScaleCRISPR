@@ -1,219 +1,348 @@
 nextflow.enable.dsl=2
 
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurper
+include { INPUT_READS } from './modules/input_reads.nf'
+include { shouldRunLibDetection } from './modules/utils.nf'
+include { expandPath } from './modules/utils.nf'
+include { reorderList; MERGING } from './modules/merging.nf'
+include { SampleStats; CropAnalysis } from './modules/sample_report.nf'
+include { resolveCrisprToRnaMapping } from './modules/utils.nf'
 
-include { inputReads } from './modules/inputReads'
+// Prepare samples.csv with defaults, rename legacy columns, etc.
+process RegularizeSamplesCsv {
+	label 'small'
+	cache 'deep'
 
-// Load .json file into object
-// (reference genomes, library design, etc.)
-def loadJson(json) {
-	def jsonSlurper  = new JsonSlurper()
-	return jsonSlurper.parse( json )
-}
+	// Publish user provided samples csv to output directory
+	publishDir params.outDir, pattern: "samples.in.csv", mode: 'copy', saveAs: {'samples.csv'}
 
-// Create a 'file()' from string 'path'
-// 'path' could be null, a s3 URL, an absolute file-path or relative to 'baseDir'
-def expandPath(path, baseDir) {
-	if (path == null) { return null}
-	if (path =~ /^s3/) { return file(path)}
-	return baseDir.resolve(path)
-}
-
-// parse sample sheet into sample name and path to allcells from that run
-
-process regularizeSamplesCsv {
-input: 
+	input: 
 	path("samples.in.csv")
-output: 
-	path("samples.csv")
-publishDir "${params.outDir}", mode: 'copy'
-cache 'deep'
-label 'small'
-script:
+	// Directory containing the library structure definition (barcode sequence lists are loaded from here)
+	path("references")
+	// Filename of the library structure definition .json
+	val(libStructName)
+	// Whether data was generated using QuantumScale assay
+	val(quantum)
+	path("guidesDir") // Directory containing guide sequences
+	path(crisprToRnaMapping) // Crispr to RNA libName mapping file
+	
+	output: 
+	path("samples.csv"), emit: samples_csv
+	path("samples.in.csv")
+
+	script:
+	libStruct = "references/$libStructName"
 	opts=""
 	if (params.splitFastq) {
-		if (params.runFolder == null) {
-			opts += "--splitSample"
-		}
+		opts += "--splitSample "
 	}
-"""
-	regularizeSamplesCsv.py samples.in.csv $opts > samples.csv
-"""
-}
-
-
-// this needs to operate on only the R2 of the reads folder
-process qcGuideinput {
-input:
-	path(guidesDir)
-	tuple(val(sample),path(fastq),path(barcode),val(guides))
-	path(libStructDir)
-	path(libGuideTemplate)
-output:
-	tuple(val(sample),path(fastq),path(barcode),path("tmpReferences/updated_LibGuideSeq.json"),path("tmpReferences/guides.output.txt"))
-publishDir "${params.outDir}/samples/${sample}/references/", pattern: "*/updated_LibGuideSeq.json", saveAs:{"updated_LibGuideSeq.json"}, mode: 'copy'
-publishDir "${params.outDir}/samples/${sample}/references/", pattern: "*/guides.output.txt", saveAs:{"post.qc.guides.txt"}, mode: 'copy'
-label 'crispr'
-tag "$sample"
-script:
-"""
-	qcGuideInput.py --fastq ${fastq} --guides ${guidesDir}/${guides} --outDir ./tmpReferences --libGuideTemplate ${libStructDir}/${libGuideTemplate}
-"""
-}
-
-// bcParser to find guide sequences
-process barcode_assignment {
-input:
-	path(libStructDir)
-	tuple(val(sample),path(fastq),path(barcode),path("tmpReferences/updated_LibGuideSeq.json"),path("tmpReferences/guides.output.txt"))
-output:
-	tuple(val(sample),path("${sample}/${sample}_*.barcodes.csv"), emit: barcodesCsv)
-	tuple(val(sample),path("${sample}/metrics.json"), emit: bc_metrics)
-tag "$sample"
-script:
-"""
-	cp $libStructDir/* ./tmpReferences/
-	bc_parser --lib-struct tmpReferences/updated_LibGuideSeq.json -v --read1 ${barcode} --read2 ${fastq} --out ${sample} --barcode-info --sample ${sample}
-"""
+	if (params.reporting) {
+		opts += "--reporting "
+	}
+	if (params.resultDir) {
+		opts += "--resultDir ${params.resultDir} "
+	}
+	if (quantum) {
+		opts += "--quantum "
+	}
+	if (params.fastqDir) {
+		opts += "--fastq "
+	}
+	if (crisprToRnaMapping) {
+		opts += "--crisprToRnaMapping ${crisprToRnaMapping} "
+	}
+	"""
+	regularize_samples_csv.py samples.in.csv --libraryStruct $libStruct --guide_dir guidesDir $opts
+	"""
 }
 
 //Generate counts, reads, and UMI matrices
-process count_guides {
-input:
-	path(allCellsDir)
-	path(libStructDir)
-	tuple(val(sample), path(barcodesCsv),val(allcells)) // bcparser output barcodes.csv and corresponding sample allCells
-output:
-	tuple(val(sample), path("guideTab.filtered.csv"), path("cellMetrics.filtered.csv"),val(allcells), emit: count_filtered)
-	tuple(val(sample), path("guideTab.csv"), path("cellMetrics.csv"),val(allcells), emit: count_raw)
-	tuple(val(sample), path("guideReads.csv"), path("guideReads.filtered.csv"),val(allcells), emit: reads)
-	tuple(val(sample),path("metrics.csv"), emit: count_metrics)
-publishDir ("${params.outDir}/samples/${sample}/", pattern: "*.csv", mode: 'copy', saveAs: {fn -> 
-	if (fn.endsWith("metrics.csv")) { "${sample}.sample.metrics.csv" }
-	else { "csv/${fn}" }
-	}
-)
-
-//publishDir "${params.outDir}/samples/${sample}/", pattern: "metrics.csv", saveAs:{"${sample}.sample.metrics.csv"}, mode: 'copy'
-//publishDir "${params.outDir}/samples/${sample}/csv/", pattern: "*.csv", mode: 'copy'
+process CountGuides {
+tag "$subsample"
 label 'crispr'
-tag "$sample"
+
+input:
+path(libStructDir)
+val(libStructName)
+val(file_ext)
+tuple val(sample), val(subsample), path("ubam_*.${file_ext}"), path(guides) // seqTagFinder bam file with guide in tag and guides file
+
+output:
+tuple val(sample), val(subsample), path("${sample}.${subsample}.umi.matrix.mtx"), path("${sample}.${subsample}.reads.matrix.mtx"), path("${sample}.${subsample}.cellMetrics.csv"), emit: count_raw
+
 script:
+libStruct = "${libStructDir}/${libStructName}"
 """
-	countGuides.py ${barcodesCsv} --allcellsCsv ${allCellsDir}/${allcells} --thresh ${params.thresh} --references ${libStructDir} --outDir ./
+	countGuides.py . --libStruct $libStruct --thresh ${params.thresh} --references ${libStructDir} --guides_file ${guides} --outDir ./ --id ${sample}.${subsample}
 """
 }
 
-//figure generation
-process crop_analysis {
-input:
-	path(allCellsDir)
-	tuple(val(sample), path("guideTab"), path("cellMetrics"),val("allcells")) // count_guides filtered cell x guide umi matrix and cell guide metrics, nf-rna output allcells.csv path
-output:
-	path("*.png")
-	path("*.txt")// for future report generation
-publishDir "${params.outDir}/samples/${sample}/analysis/", mode: 'copy'
-label 'crispr'
+process MergeCountRaw {
+    tag "$sample"
+	label 'large'
+
+    input:
+    tuple val(sample), path(umiMtx), path(readsMtx), path(cellMetrics)
+
+    output:
+    tuple val(sample), path("${sample}.umi.matrix.mtx"), path("${sample}.reads.matrix.mtx"), path("${sample}.cellMetrics.csv"), emit: countRaw
+
+    script:
+    """
+    concat_columnar.py $cellMetrics --outputFile "${sample}.cellMetrics.csv"
+    merge_mtx.py $umiMtx --outputFile "${sample}.umi.matrix.mtx"
+    merge_mtx.py $readsMtx --outputFile "${sample}.reads.matrix.mtx"
+    """
+}
+
+process FilterBarcodes {
 tag "$sample"
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "filtered.reads.matrix.mtx", mode: 'copy', saveAs: { "filtered_reads_mtx/matrix.mtx" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "filtered.barcodes.tsv", mode: 'copy', saveAs: { "filtered_reads_mtx/barcodes.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "features.tsv", mode: 'copy', saveAs: { "filtered_reads_mtx/features.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "filtered.umi.matrix.mtx", mode: 'copy', saveAs: { "filtered_umi_mtx/matrix.mtx" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "filtered.barcodes.tsv", mode: 'copy', saveAs: { "filtered_umi_mtx/barcodes.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "features.tsv", mode: 'copy', saveAs: { "filtered_umi_mtx/features.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "reads.matrix.mtx", mode: 'copy', saveAs: { "raw_reads_mtx/matrix.mtx" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "barcodes.tsv", mode: 'copy', saveAs: { "raw_reads_mtx/barcodes.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "features.tsv", mode: 'copy', saveAs: { "raw_reads_mtx/features.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "umi.matrix.mtx", mode: 'copy', saveAs: { "raw_umi_mtx/matrix.mtx" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "barcodes.tsv", mode: 'copy', saveAs: { "raw_umi_mtx/barcodes.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "features.tsv", mode: 'copy', saveAs: { "raw_umi_mtx/features.tsv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "cellMetrics.csv", mode: 'copy', saveAs: { "${sample}.cellMetrics.csv" }
+publishDir { file(params.outDir) / "samples" / sample }, pattern: "cellMetrics.filtered.csv", mode: 'copy', saveAs: { "${sample}.cellMetrics.filtered.csv" }
+
+input:
+tuple val(sample), path("umi.matrix.mtx"), path("reads.matrix.mtx"), path("cellMetrics.csv"), path(barcodes), path("features.tsv")
+path(crisprToRnaMapping) // Crispr to RNA libName mapping file
+
+output:
+tuple val(sample), path("filtered.umi.matrix.mtx"), path("cellMetrics.filtered.csv"), emit: countFiltered
+tuple val(sample), path("filtered.reads.matrix.mtx"), emit: readsFiltered
+tuple val(sample), path("umi.matrix.mtx", includeInputs: true)
+tuple val(sample), path("reads.matrix.mtx", includeInputs: true)
+tuple val(sample), path("cellMetrics.csv", includeInputs: true)
+tuple val(sample), path("filtered.barcodes.tsv")
+tuple val(sample), path("barcodes.tsv")
+tuple val(sample), path("features.tsv", includeInputs: true)
+
+script:
+	if (crisprToRnaMapping) {
+		opts = "--crisprToRnaMapping ${crisprToRnaMapping} "
+	}
+"""
+	filter_barcodes.py --umiMatrix umi.matrix.mtx --readsMatrix reads.matrix.mtx \
+		--thresh ${params.thresh} --barcodes $barcodes --cellMetrics cellMetrics.csv $opts
+"""
+}
+
+process LibraryReport {
+input:
+	path(lib_template)
+	tuple val(libs), path(metrics)
+output:
+	path("library.report.html")
+publishDir { file(params.outDir) / "reports" / "library" }, mode: 'copy'
 script:
 """
-	cropAnalysis.py --sample ${sample} --guideTabCsv ${guideTab} --allcellsCsv ${allCellsDir}/${allcells} --guideMetricsCsv ${cellMetrics} --thresh ${params.thresh} --outDir ./
+	generate_library_report.py --libs ${libs.join(" ")} --metrics $metrics --template $lib_template --outDir .
 """
 }
 
 workflow {
-	// be sure to join outputs on sample to ensure that files are properly paired
-	// Call initialise function in Helper.groovy to pretty print important
-	// parameters along with some additional information about the pipeline
-
-	regularizeSamplesCsv(file(params.samples))
-	samplesCsv = regularizeSamplesCsv.out
+	ParamLogger.initialise(workflow, params, log)
+	// Load rna library structure json
+	libJson = expandPath(params.libStructure, file(projectDir) / "references")
+	libJsonContents = Utils.loadJson(libJson)
+	crisprToRnaMapping = resolveCrisprToRnaMapping(libJson)
+	libraryInfo = [
+		rnaLibraryStructureFile: libJson,
+		rnaTrimAdapter: libJsonContents["trimAdapter"],
+		rnaGenomicR1: libJsonContents.get('genomic_r1', false),
+		rnaGenomicR2: libJsonContents.get('genomic_r2', false),
+		quantum: libJsonContents.get('quantum', false),
+		sampleBarcode: libJsonContents["sample_barcode"],
+		crisprToRnaMappingFile: crisprToRnaMapping,
+	]
+	RegularizeSamplesCsv(
+		file(params.samples, checkIfExists:true),
+		libraryInfo.rnaLibraryStructureFile.getParent(),
+		libraryInfo.rnaLibraryStructureFile.getName(),
+		libraryInfo.quantum,
+		file(params.guidesDir),
+		libraryInfo.crisprToRnaMappingFile
+	)
+	samplesCsv = RegularizeSamplesCsv.out.samples_csv
 	samples = samplesCsv.splitCsv(header:true, strip:true)
+	samples.dump(tag:'samples')
+	runLibDetection = shouldRunLibDetection(file(params.samples, checkIfExists:true), libraryInfo.quantum)
+	// INPUT_READS runs bcParser on fastq files to demux per sample to unaligned bam files
+	INPUT_READS(
+		samples,
+		samplesCsv,
+		libraryInfo,
+		params.runFolder,
+		params.fastqDir,
+		runLibDetection
+	)
 
-	//3lvl libJson without the inclusion of the CROP guide detection, for the initial bcParser demux by sample performed by inputReads below
-	libJson = expandPath(params.libStructure, file("${projectDir}/references/"))
-	//call input reads and create per-sample fastq files split by PCR well. 
-	inputReads(samples, samplesCsv, libJson, params.runFolder, params.fastqDir, params.fastqSamplesheet, params.trimFastq, params.fastqc, params.outDir, params.bclConvertParams, params.splitFastq, params.trimAdapt)
+	file_ext = params.ultimaCramDir ? 'cram' : 'bam'
+	INPUT_READS.out.ubam
+		.groupTuple(by: [0,1])
+		.combine(
+			INPUT_READS.out.samples.map {
+				[it.id, file(params.guidesDir) / it.guide]
+			},
+			by: 0
+		).dump(tag: 'countGuidesInput')
+		.set { countGuidesInput }
 
-	fqsSorted = inputReads.out.fqs.toSortedList().flatMap()
-	fqsSorted.dump(tag:'fqsSorted')
-	alignFqJobGroups = fqsSorted.groupTuple()
-
-	// Sort transcript and barcode files
-	alignFqJobGroups = alignFqJobGroups.map {
-		tuple(it[0], it[1].sort(), it[2].sort())
+	CountGuides(libJson.getParent(), libJson.getName(), file_ext, countGuidesInput)
+	CountGuides.out.count_raw
+		.map { id, _subsample, rawUmi, readsUmi, cellMetrics ->
+		// drop subsample that was used for splitting
+		[id, rawUmi, readsUmi, cellMetrics]
+		}
+		.set { perSampleCountRaw }
+	if (params.splitFastq) {
+		perSampleCountRaw
+			// collect all cellMetrics, barcodes, and umi.sparse.mtx for each lib and sample combination
+			.groupTuple()
+			| MergeCountRaw
+			| set { perSampleCountRaw }
 	}
 
-	//generate input channels for QC of guide sequences
-	guides = samples.map{
-		tuple(it.sample, it.guide)
+	// resolve the result directory for each sample
+	barcodes = INPUT_READS.out.samples.map {
+		if (it.resultDir == null) {
+			ParamLogger.throwError("Sample ${it.id} does not have a resultDir specified in samples.csv.")
+		}
+		barcodesTsv = file(it.resultDir).resolve("samples/${it.sample}.${it.rnaLibName}.filtered.matrix/barcodes.tsv.gz")
+		if (!barcodesTsv.exists()) {
+			barcodesTsv = file(it.resultDir).resolve("samples/${it.sample}_libraries/${it.sample}.${it.rnaLibName}.filtered.matrix/barcodes.tsv.gz")
+		}
+		if (!barcodesTsv.exists()) {
+			ParamLogger.throwError("Sample ${it.sample}.${it.rnaLibName} was not found in the resultDir: ${it.resultDir}.")
+		}
+		[it.id, barcodesTsv]
 	}
 
-	fastq_qc_ch = alignFqJobGroups.join(guides)
-	fastq_qc_ch.dump(tag:'fastq_qc_ch')
+	FilterBarcodes(
+		perSampleCountRaw
+		    .join(barcodes)
+			.join(
+				INPUT_READS.out.samples.map {
+					[it.id, file(params.guidesDir) / it.guide]
+				}
+			),
+		libraryInfo.crisprToRnaMappingFile
+	)
 
-	libTemplate = expandPath(params.libTemplate, file("${projectDir}/references/"))
+	SampleStats(
+		perSampleCountRaw
+			.map { sample, _rawUmi, _readsUmi, cellMetrics ->
+				[sample, cellMetrics]
+			}
+			.join(FilterBarcodes.out.countFiltered
+					.map { sample, _filteredUmi, filteredMetrics ->
+						[sample, filteredMetrics]
+					})
+			.join(
+				INPUT_READS.out.samples.map {
+					[it.id, file(params.guidesDir) / it.guide]
+				}
+			)
+	)
 
-	//qc guide input and write out proper libstruct.json for each sample
-	qcGuideinput(params.guidesDir,fastq_qc_ch,libJson.getParent(),libTemplate)
-	
+	LibraryReport(
+		file(projectDir) / "templates" / "library_report_template.html",
+		// collect all libraries and their metrics, e.g. [['QSR-1', 'QSR-2'], [/path/to/QSR-1.metrics.json, /path/to/QSR-2.metrics.json]]
+		INPUT_READS.out.metrics
+			.collect(flat: false)
+			.transpose()
+			.collect(flat: false)
+			.map {
+				libs, metrics ->
+				[
+					reorderList(libs, libs),
+					reorderList(metrics, libs)
+				]
+			}
+	)
 
-	//perform bcParser detection of guide sequences with updated_libstructJson as output from qcGuide_input and fastq files from inputreads
-	barcode_assignment(libJson.getParent(),qcGuideinput.out)
+	CropAnalysis(
+		libJson.name,
+		file(projectDir) / "templates" / "qc_report_template.html",
+		FilterBarcodes.out.countFiltered
+		 	.join(SampleStats.out.sample_metrics)
+			.join(
+				INPUT_READS.out.samples.map { [it.id, it.barcodes] }
+			)
+	)
 
-	//generate input channel of 
-	allcells = samples.map{[it.sample, it.allCells]}
-
-	count_input_ch = barcode_assignment.out.barcodesCsv.join(allcells)
-	count_guides(params.allCellsDir,libJson.getParent(),count_input_ch)
-
-	crop_analysis(params.allCellsDir,count_guides.out.count_filtered)
+	if (params.merge) {
+		MERGING(
+			INPUT_READS.out.samples,
+			libJson,
+			FilterBarcodes.out.countFiltered
+				.map { sample, _filteredUmi, filteredMetrics ->
+					[sample, filteredMetrics]
+				},
+			perSampleCountRaw
+				.map { sample, _rawUmi, _readsUmi, cellMetrics ->
+					[sample, cellMetrics]
+				},
+			FilterBarcodes.out.readsFiltered,
+			FilterBarcodes.out.countFiltered
+				.map { sample, filteredUmi, _filteredMetrics ->
+					[sample, filteredUmi]
+				},
+			INPUT_READS.out.samples.map {
+				[it.id, file(params.guidesDir) / it.guide]
+			},
+			barcodes,
+		)
+	}
 
 }
 
-// Function that gets invoked when workflow completes
-// Publishes a file named workflow_info.json that contains information about the pipeline execution
+//// When the workflow completes, publish 'workflow_info.json' containing information on pipeline metadata
 workflow.onComplete {
 	testing = false
-	def data = ["Workflow Information": ["Execution status": "${ workflow.success ? 'OK' : 'failed' }",
-										 "Pipeline completion timestamp": "$workflow.complete",
-										 "Git repo URL": "$workflow.repository",
-										 "Configuration files": "$workflow.configFiles",
-		 		 						 "Container": "$workflow.container",
-				 						 "Command line executed": "$workflow.commandLine",
-						 				 "Configuration profile": "$workflow.profile",
-								 		 "Start timestamp": "$workflow.start",
-		 								 "Stop timestamp": "$workflow.complete",
-										 "Run name": "$workflow.runName",
-										 "Revision": "$workflow.revision",
-										 "Commit ID": "$workflow.commitId",
-										 "Duration": "$workflow.duration"]]
+	def workflow_data = ["Nextflow Information":
+		["Execution status": "${ workflow.success ? 'OK' : 'failed' }",
+		"Run name": "$workflow.runName",
+		"Pipeline completion timestamp": "$workflow.complete",
+		"Git repo URL": "$workflow.repository",
+		"Configuration files": "$workflow.configFiles",
+		"Container": "$workflow.container",
+		"Command line executed": "$workflow.commandLine",
+		"Configuration profile": "$workflow.profile",
+		"Start timestamp": "$workflow.start",
+		"Stop timestamp": "$workflow.complete",
+		"Exit status": "$workflow.exitStatus",
+		"Error message": "$workflow.errorMessage",
+		"Revision": "$workflow.revision",
+		"Commit ID": "$workflow.commitId",
+		"Duration": "$workflow.duration"]
+	]
 	def params_data = ["Parameters": [:]]
 	for (p in params) {
 		if (!p.key.contains('-')) {
 			params_data."Parameters".put("$p.key", "$p.value")
 		}
-		if (p.key.equals('testing_run')) {
-			testing = true
-			data."Workflow Information".put("Exit status", "$workflow.exitStatus")
-			data."Workflow Information".put("Error message", "$workflow.errorMessage")
-
-		}
-		
-	}
-
-	def manifest_data = ["Manifest": [:]]
+    }
+	def manifest_data = ["Workflow Manifest": [:]]
 	for (p in workflow.manifest.getProperties()) {
 		p = p.toString()
 		def split_str = p.split("=")
 		if (split_str[0].equals("name") || split_str[0].equals("version")) {
-			manifest_data."Manifest".put(split_str[0], split_str[1])
+			manifest_data["Workflow Manifest"].put(split_str[0], split_str[1])
 		}
 	}
 
-	def json_str = JsonOutput.toJson(data+params_data+manifest_data)
-	def json_beauty = JsonOutput.prettyPrint(json_str)
-	workflow_info = file("$params.outDir/workflow_info.json")
+	def json_str = groovy.json.JsonOutput.toJson(manifest_data + workflow_data + params_data)
+	def json_beauty = groovy.json.JsonOutput.prettyPrint(json_str)
+	def workflow_info = file(params.outputDir) / "workflow_info.json"
 	workflow_info.write(json_beauty)
 }

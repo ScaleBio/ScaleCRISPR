@@ -9,6 +9,7 @@
     {"read": "index2", "start": 0, "length": 10, "name": "P7", "sequences": "3lvlRNA_pcr.txt", "level":3, "alias":"PCR"}
 ],
 "sample_barcode": "rt",
+"genomic_r2": {"start":0, "min_length":16},
 "star_barcode_param": "--soloType CB_UMI_Simple --soloCBlen 29 --soloUMIstart 30 --soloUMIlen 8 --soloCBwhitelist None",
 "bcl_convert": {
     "library_barcodes": {},

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>QC Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { margin-bottom: 5px; }
+        nav a {
+            margin-right: 20px;
+            text-decoration: none;
+            padding: 5px 10px;
+            border-bottom: 2px solid transparent;
+            color: black;
+        }
+        nav a.active { border-bottom: 2px solid #4f46e5; font-weight: normal; }
+        table {
+            border-collapse: collapse;
+            margin: 20px 0;
+            width: 100%;
+        }
+        th, td {
+            border: 2px solid #000;
+            padding: 6px 10px;
+            text-align: center;
+        }
+        .table-title {
+            font-weight: bold;
+            font-size: 1.1em;
+            background-color: #f8f8f8;
+            border-bottom: 4px solid black;
+        }
+        .table-spacer {
+            height: 12px;
+            background-color: white;
+            border: none;
+        }
+        .flex-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .flex-item {
+            flex: 1 1 45%;  /* grow, shrink, base width */
+            min-width: 300px;  /* triggers stacking on small screens */
+        }
+
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+    </style>
+</head>
+<body>
+
+<nav>
+    <a href="#summary" class="active">Summary</a>
+</nav>
+
+<div id="summary" class="flex-container">
+    <table class="flex-item">
+        <tr>
+        <th colspan="2" class="table-title">Sample Information</th>
+        </tr>
+        {% for row in sample_info %}
+        <tr><th>{{ row[0] }}</th><td>{{ row[1] }}</td></tr>
+        {% endfor %}
+
+    </table>
+
+    <table class="flex-item">
+        <tr>
+        <th colspan="2" class="table-title">Read Metrics</th>
+        </tr>
+        {% for row in read_metrics %}
+        <tr><th>{{ row[0] }}</th><td>{{ row[1] }}</td></tr>
+        {% endfor %}
+
+        <tr><td colspan="2" class="table-spacer"></td></tr>
+
+        <tr>
+        <th colspan="2" class="table-title">Cell Metrics</th>
+        </tr>
+        {% for row in cell_metrics %}
+        <tr><th>{{ row[0] }}</th><td>{{ row[1] }}</td></tr>
+        {% endfor %}
+
+    </table>
+
+    {% for plot in plots %}
+    <div class="flex-item">
+        <img src="{{ plot.src }}" alt="{{ plot.title }}">
+    </div>
+    {% endfor %}
+</div>
+
+</body>
+</html>

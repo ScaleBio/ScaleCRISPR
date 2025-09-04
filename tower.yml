@@ -1,4 +1,8 @@
 reports:
+    "reports/library/library.report.html":
+        display: "Library QC report"
+    "reports/**.report.html":
+        display: "Sample QC report"
     "*metrics.csv":
         display: "Sample Summary"
     "reports/multiqc_report.html":
